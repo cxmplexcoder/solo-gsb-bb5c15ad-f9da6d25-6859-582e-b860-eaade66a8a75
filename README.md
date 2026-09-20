@@ -51,6 +51,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PORT`（容器内） | `8000` | 容器内监听端口 |
 | `LOG_LEVEL` | `info` | uvicorn 日志级别 |
 | `MAX_BATCH_PLAN_COMBINATIONS` | `100000` | 批量数据方案组合上限（折叠过程中生成的并集组合数），超过返回 `422` |
+| `MAX_DECISION_TABLE_COMBINATIONS` | `100000` | 决策表组合上限（字段域笛卡尔积大小），超过返回 `422` |
 
 无数据库等其他依赖；策略保存在进程内存中，重启即清空。
 
@@ -75,6 +76,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
 | POST | `/api/v1/policies/{id}/batch-data-plans` | 批量数据方案：让全部 unknown 案例可判定的最小全局字段集合 |
 | POST | `/api/v1/policies/{id}/replacement-preview` | 替换影响预览：候选规则对案例集的业务影响（不写入存储） |
+| POST | `/api/v1/policies/{id}/decision-table` | 决策表：枚举字段域笛卡尔积并返回自底向上压缩的决策树（不写入存储） |
 | POST | `/api/v1/adjudication-flows/evaluate` | 裁决流：内联节点图按裁决结果在已存策略间路由（不写入存储） |
 
 ## 策略结构
@@ -577,18 +579,105 @@ curl -s -X POST localhost:8000/api/v1/adjudication-flows/evaluate \
 - `steps` 为**有序节点轨迹**：每个被执行节点一条，含该节点的裁决状态、
   结论与实际命中的路由（未命中为 `null`）。
 
+## 决策表示例（decision-table）
+
+提交一组**字段域**（字段名 → 该字段可取值的 JSON 字面量数组），服务按
+**字段名字典序**枚举各域的笛卡尔积，用现有裁决引擎逐组合裁决，并把每个
+裁决压缩成与替换影响预览相同的**业务签名**作为叶子。全部叶子先构成一棵
+按该字段顺序逐层分支的决策树，再**自底向上压缩**：仅当某节点对该字段域内
+**所有**取值得到的子树完全相同时，该节点才折叠为这唯一一棵子树；不允许跨
+签名合并，也不允许仅凭部分分支相同就合并。整个过程只读取策略，**不写入
+存储**。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `domains` | 非空 object | 字段名 → 该字段域的**非空数组**，元素为互不重复的 JSON 字面量（`null`、布尔、数值、字符串、数组或对象；`NaN`/`Infinity` 不是合法字面量） |
+
+语义与约束：
+
+- 字段按**名字字典序**逐层分支；同一节点内分支按域值的**规范 JSON 序**
+  （`json.dumps(..., sort_keys=True)`）排列，因此响应与 `domains` 的声明
+  顺序、域内值的排列顺序无关。
+- 树节点：叶子为 `{"signature": <业务签名>}`；内部节点为
+  `{"field": <字段名>, "branches": [{"value": <域值>, "node": <子树>}, ...]}`。
+  单值域的节点必然折叠（“所有取值”只有一个），整表签名全同时整棵树折叠
+  为单个叶子。
+- 组合总数（各域大小的乘积）超过 `MAX_DECISION_TABLE_COMBINATIONS`
+  （默认 `100000`，可用环境变量配置）时返回 `422`，**不会截断**结果。
+- 非法请求（`domains` 缺失/为空、域为空数组、域内值重复、值不是 JSON
+  字面量、含未知键等）返回 `422`，响应体含 `errors` 列表；策略不存在
+  返回 `404`。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/decision-table \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "domains": {
+      "income": [40000, 80000],
+      "debt_ratio": [0.2, 0.55, 0.7]
+    }
+  }'
+```
+
+响应（以上面“裁决示例”中创建的策略为准；字段按字典序先 `debt_ratio`
+后 `income`）：
+
+```json
+{
+  "policy_id": "ab12...",
+  "fields": ["debt_ratio", "income"],
+  "total_combinations": 6,
+  "tree": {
+    "field": "debt_ratio",
+    "branches": [
+      { "value": 0.2,
+        "node": {
+          "field": "income",
+          "branches": [
+            { "value": 40000,
+              "node": { "signature": { "status": "no_match",
+                                       "conclusion": null,
+                                       "decided_priority": null } } },
+            { "value": 80000,
+              "node": { "signature": { "status": "decided",
+                                       "conclusion": "approve",
+                                       "decided_priority": 10 } } }
+          ]
+        } },
+      { "value": 0.55,
+        "node": { "signature": { "status": "no_match",
+                                 "conclusion": null,
+                                 "decided_priority": null } } },
+      { "value": 0.7,
+        "node": { "signature": { "status": "decided",
+                                 "conclusion": "reject",
+                                 "decided_priority": 10 } } }
+    ]
+  }
+}
+```
+
+即：`debt_ratio` 为 `0.55`（恒 `no_match`）与 `0.7`（恒 `reject`）时
+`income` 不影响结果，对应子树分别折叠为单叶；`debt_ratio` 为 `0.2` 时
+结果仍取决于 `income`，保留分支。注意 `0.2/40000` 与 `0.55` 两处同为
+`no_match` 的叶子**不会**被跨子树合并——只有同一节点下全部取值完全
+一致时才折叠。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 路由、健康检查、请求模型
-  validation.py      # 策略结构校验、反事实/批量/替换预览/裁决流请求校验
+  validation.py      # 策略结构校验、反事实/批量/替换预览/裁决流/决策表请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
   sources.py         # 多来源带优先级事实合并：最高优先级比较、冲突/null 不回填
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
   batch.py           # 批量数据方案：逐案裁决、全局最小字段集合组合
   preview.py         # 替换影响预览：业务签名、变化列表与迁移汇总
+  decision_table.py  # 决策表：域笛卡尔积枚举、业务签名叶子、自底向上压缩树
   flow.py            # 裁决流：逐节点裁决、按裁决结果路由与终止
   store.py           # 加锁的内存策略存储
 tests/               # 纯标准库 runner，也可用 pytest
@@ -607,5 +696,6 @@ python3 tests/test_logic.py && python3 tests/test_engine.py && \
 python3 tests/test_api.py && python3 tests/test_evaluate_sources.py && \
 python3 tests/test_counterfactual.py && \
 python3 tests/test_batch_data_plans.py && \
-python3 tests/test_replacement_preview.py && python3 tests/test_flow.py
+python3 tests/test_replacement_preview.py && python3 tests/test_flow.py && \
+python3 tests/test_decision_table.py
 ```

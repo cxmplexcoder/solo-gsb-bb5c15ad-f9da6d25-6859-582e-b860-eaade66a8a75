@@ -6,9 +6,11 @@ human-readable errors (one error per detected problem where practical).
 """
 from __future__ import annotations
 
+import math
 from collections import Counter
 from typing import Any, Callable, Optional
 
+from .counterfactual import canonical_json
 from .logic import COMPARISONS
 
 MAX_EXPR_DEPTH = 64
@@ -333,6 +335,63 @@ def validate_replacement_preview_request(payload: Any) -> tuple[list[dict], list
     if errors:
         raise PolicyValidationError(errors)
     return rules, cases
+
+
+def validate_decision_table_request(payload: Any) -> dict[str, list]:
+    """Validate a decision table request body.
+
+    The body must be ``{"domains": {field: [literal, ...], ...}}`` with a
+    non-empty ``domains`` object; every domain is a non-empty array of
+    pairwise distinct JSON literals (``NaN``/``Infinity`` are not literals).
+    Returns the ``domains`` mapping in declaration order; raises
+    :class:`PolicyValidationError` with one error string per detected
+    problem.
+    """
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+
+    errors: list[str] = []
+
+    unknown_keys = set(payload) - {"domains"}
+    if unknown_keys:
+        errors.append(f"unknown keys {sorted(unknown_keys)}")
+
+    raw_domains = payload.get("domains")
+    if not isinstance(raw_domains, dict) or not raw_domains:
+        errors.append("domains: must be a non-empty object")
+        raise PolicyValidationError(errors)
+
+    normalized: dict[str, list] = {}
+    for field, values in raw_domains.items():
+        prefix = f"domains.{field}"
+        if not isinstance(field, str) or not field:
+            errors.append(f"{prefix}: field name must be a non-empty string")
+            continue
+        if not isinstance(values, list) or not values:
+            errors.append(f"{prefix}: must be a non-empty array")
+            continue
+
+        seen: set[str] = set()
+        for index, value in enumerate(values):
+            if not _json_literal(value) or (
+                isinstance(value, float) and not math.isfinite(value)
+            ):
+                errors.append(
+                    f"{prefix}[{index}]: must be a JSON literal "
+                    "(null, bool, number, string, array or object of "
+                    "literals)"
+                )
+                continue
+            key = canonical_json(value)
+            if key in seen:
+                errors.append(f"{prefix}[{index}]: duplicate value {key}")
+            else:
+                seen.add(key)
+        normalized[field] = list(values)
+
+    if errors:
+        raise PolicyValidationError(errors)
+    return normalized
 
 
 def validate_flow_request(
