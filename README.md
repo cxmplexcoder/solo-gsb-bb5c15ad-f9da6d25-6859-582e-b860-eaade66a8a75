@@ -51,6 +51,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PORT`（容器内） | `8000` | 容器内监听端口 |
 | `LOG_LEVEL` | `info` | uvicorn 日志级别 |
 | `MAX_BATCH_PLAN_COMBINATIONS` | `100000` | 批量数据方案组合上限（折叠过程中生成的并集组合数），超过返回 `422` |
+| `MAX_DECISION_TABLE_COMBINATIONS` | `100000` | 决策表笛卡尔积组合数上限（叶子裁决次数），超过返回 `422` |
 
 无数据库等其他依赖；策略保存在进程内存中，重启即清空。
 
@@ -75,6 +76,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
 | POST | `/api/v1/policies/{id}/batch-data-plans` | 批量数据方案：让全部 unknown 案例可判定的最小全局字段集合 |
 | POST | `/api/v1/policies/{id}/replacement-preview` | 替换影响预览：候选规则对案例集的业务影响（不写入存储） |
+| POST | `/api/v1/policies/{id}/decision-table` | 决策表：字段值域笛卡尔积枚举 + 自底向上压缩的业务签名决策树（不写入存储） |
 | POST | `/api/v1/adjudication-flows/evaluate` | 裁决流：内联节点图按裁决结果在已存策略间路由（不写入存储） |
 
 ## 策略结构
@@ -495,6 +497,95 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/replacement-preview \
 `applicant-1` 不受影响；`transition_counts` 完整覆盖全部 3 个案例的迁移
 分布。确认影响后如需真正替换策略，再调用 `PUT /api/v1/policies/{id}`。
 
+## 决策表示例（decision-table）
+
+一次请求给出**字段名 → 去重 JSON 字面量数组（值域）**，服务把字段名按
+**字典序**排列，枚举各字段值域的**笛卡尔积**，逐组合复用与 `/evaluate`
+完全相同的裁决引擎，并以 replacement-preview 的**业务签名**（`status`、
+`conclusion`、`decided_priority`，`conflict` 附 `conflicting_conclusions`、
+`unknown` 附 `minimal_missing_field_sets` 与 `pending_conclusions`）作为叶子。
+整棵决策树只读取策略，**不写入存储**。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `domains` | 非空 object | 键为非空字段名字符串，值为**非空 JSON 字面量数组**；值按规范 JSON 判重，不允许重复（`1` 与 `1.0`、`true` 视为不同字面量，`true != 1`） |
+
+树节点有三种类型：
+
+- `{"type": "leaf", "signature": {...}}` —— 叶子，挂业务签名；
+- `{"type": "split", "field": <字段>, "branches": [{"value", "child"}, ...]}`
+  —— 按该字段取值分叉，分支按值的**类型感知规范 JSON** 稳定排序；
+- `{"type": "uniform", "field": <字段>, "child": {...}}` —— 该字段取域内
+  **所有值时子树完全相同**，折叠为一棵与取值无关的子树。
+
+自底向上压缩规则严格：**仅当一个节点对该字段域内所有值的子树完全相同**
+（逐分支逐子树相等，叶子则要求完整业务签名相等）时才折叠；**不能跨签名
+合并，也不能仅凭部分分支一致就合并**。压缩从最深层向上传播（子树折叠后
+父节点可能随之折叠）。响应中的字段顺序固定为字段名字典序，因此重复请求
+逐字节一致。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/decision-table \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "domains": {
+      "income": [40000, 60000],
+      "debt_ratio": [0.3, 0.5, 0.7]
+    }
+  }'
+```
+
+响应（以上面“裁决示例”中创建的策略为当前策略；字段重排为
+`debt_ratio`、`income`，总组合数 `3 × 2 = 6`）：
+
+```json
+{
+  "policy_id": "ab12...",
+  "fields": ["debt_ratio", "income"],
+  "total_combinations": 6,
+  "tree": {
+    "type": "split",
+    "field": "debt_ratio",
+    "branches": [
+      {"value": 0.3, "child": {"type": "split", "field": "income",
+        "branches": [
+          {"value": 40000, "child": {"type": "leaf",
+            "signature": {"status": "no_match", "conclusion": null,
+                          "decided_priority": null}}},
+          {"value": 60000, "child": {"type": "leaf",
+            "signature": {"status": "decided", "conclusion": "approve",
+                          "decided_priority": 10}}}
+        ]}},
+      {"value": 0.5, "child": {"type": "uniform", "field": "income",
+        "child": {"type": "leaf",
+          "signature": {"status": "no_match", "conclusion": null,
+                        "decided_priority": null}}}},
+      {"value": 0.7, "child": {"type": "uniform", "field": "income",
+        "child": {"type": "leaf",
+          "signature": {"status": "decided", "conclusion": "reject",
+                        "decided_priority": 10}}}}
+    ]
+  }
+}
+```
+
+即：`debt_ratio=0.3` 时结果取决于收入（分叉保留）；`debt_ratio=0.5` 对
+两种收入都是 `no_match`、`debt_ratio=0.7` 对两种收入都是 `reject`，因此
+这两层各自折叠为与 `income` 取值无关的单一子树。
+
+约束与错误：
+
+- 笛卡尔积叶子数（各值域大小之积）超过环境变量
+  `MAX_DECISION_TABLE_COMBINATIONS`（默认 `100000`）时返回 `422`
+  （`detail` 为 `Decision table search failed`），**不会截断结果**；
+  收窄值域或调高上限即可。
+- 严格校验：顶层未知键、`domains` 缺失/为空/非对象、字段名为空、值域为空
+  或非数组、值不是 JSON 字面量（含 `NaN` / `Infinity` 等非有限数）、
+  值域内重复值，均返回 `422`，响应体含 `errors` 列表。
+- 策略不存在返回 `404`；请求体不是合法 JSON 返回 `400`。
+
 ## 裁决流示例（adjudication-flows/evaluate）
 
 一次请求内联一张**节点有向图**：每个节点引用一条**已存策略**并声明路由 ——
@@ -582,13 +673,14 @@ curl -s -X POST localhost:8000/api/v1/adjudication-flows/evaluate \
 ```
 app/
   main.py            # FastAPI 路由、健康检查、请求模型
-  validation.py      # 策略结构校验、反事实/批量/替换预览/裁决流请求校验
+  validation.py      # 策略结构校验、反事实/批量/替换预览/决策表/裁决流请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
   sources.py         # 多来源带优先级事实合并：最高优先级比较、冲突/null 不回填
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
   batch.py           # 批量数据方案：逐案裁决、全局最小字段集合组合
   preview.py         # 替换影响预览：业务签名、变化列表与迁移汇总
+  decision_table.py  # 决策表：笛卡尔积枚举、自底向上压缩的签名决策树
   flow.py            # 裁决流：逐节点裁决、按裁决结果路由与终止
   store.py           # 加锁的内存策略存储
 tests/               # 纯标准库 runner，也可用 pytest
@@ -607,5 +699,6 @@ python3 tests/test_logic.py && python3 tests/test_engine.py && \
 python3 tests/test_api.py && python3 tests/test_evaluate_sources.py && \
 python3 tests/test_counterfactual.py && \
 python3 tests/test_batch_data_plans.py && \
-python3 tests/test_replacement_preview.py && python3 tests/test_flow.py
+python3 tests/test_replacement_preview.py && \
+python3 tests/test_decision_table.py && python3 tests/test_flow.py
 ```

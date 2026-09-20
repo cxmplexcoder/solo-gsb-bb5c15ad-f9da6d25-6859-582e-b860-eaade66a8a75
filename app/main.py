@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from .batch import BatchPlanSearchError, batch_data_plans
 from .counterfactual import CounterfactualSearchError, counterfactuals
+from .decision_table import DecisionTableSearchError, build_decision_table
 from .engine import adjudicate
 from .flow import run_flow
 from .preview import replacement_preview
@@ -20,6 +21,7 @@ from .validation import (
     SourceValidationError,
     validate_batch_data_plans_request,
     validate_counterfactual_request,
+    validate_decision_table_request,
     validate_evaluate_sources_request,
     validate_flow_request,
     validate_policy,
@@ -43,9 +45,11 @@ app = FastAPI(
         "report the business-impact changes without touching storage. "
         "Adjudication flows chain stored policies through verdict routes "
         "and return the termination reason, the final business signature "
-        "and the ordered node trace. Source-based evaluation merges facts "
-        "from multiple named, integer-priority sources per field before "
-        "adjudicating with the same engine."
+        "and the ordered node trace. Decision tables enumerate the "
+        "Cartesian product of per-field value domains and return it as a "
+        "bottom-up compressed tree of business signatures. Source-based "
+        "evaluation merges facts from multiple named, integer-priority "
+        "sources per field before adjudicating with the same engine."
     ),
 )
 
@@ -88,6 +92,19 @@ async def batch_plan_search_handler(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "detail": "Batch data plan search failed",
+            "errors": [str(exc)],
+        },
+    )
+
+
+@app.exception_handler(DecisionTableSearchError)
+async def decision_table_search_handler(
+    request: Request, exc: DecisionTableSearchError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Decision table search failed",
             "errors": [str(exc)],
         },
     )
@@ -309,6 +326,35 @@ async def policy_replacement_preview(policy_id: str, request: Request) -> dict:
         "change_count": len(changes),
         "changes": changes,
         "transition_counts": transition_counts,
+    }
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/decision-table",
+    tags=["adjudication"],
+)
+async def policy_decision_table(policy_id: str, request: Request) -> dict:
+    """Enumerate the Cartesian product of field domains as a decision tree.
+
+    Field names are ordered lexicographically and every combination of their
+    domains is adjudicated with the regular engine; leaves carry the
+    replacement-preview business signature.  The tree is compressed
+    bottom-up into value-branching and value-independent nodes.  The policy
+    store is only read.
+    """
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    payload = await _json_body(request)
+    domains = validate_decision_table_request(payload)
+
+    fields, total_combinations, tree = build_decision_table(record, domains)
+    return {
+        "policy_id": policy_id,
+        "fields": fields,
+        "total_combinations": total_combinations,
+        "tree": tree,
     }
 
 

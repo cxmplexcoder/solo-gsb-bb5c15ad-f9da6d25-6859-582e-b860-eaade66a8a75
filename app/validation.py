@@ -6,9 +6,11 @@ human-readable errors (one error per detected problem where practical).
 """
 from __future__ import annotations
 
+import math
 from collections import Counter
 from typing import Any, Callable, Optional
 
+from .counterfactual import canonical_json
 from .logic import COMPARISONS
 
 MAX_EXPR_DEPTH = 64
@@ -184,8 +186,10 @@ def _validate_expr(node: Any, path: str, depth: int) -> list[str]:
 
 
 def _json_literal(value: Any) -> bool:
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
         return True
+    if isinstance(value, float):
+        return math.isfinite(value)
     if isinstance(value, list):
         return all(_json_literal(v) for v in value)
     if isinstance(value, dict):
@@ -551,6 +555,72 @@ def _find_reachable_cycle(
             stack.pop()
             path.pop()
     return None
+
+
+def validate_decision_table_request(payload: Any) -> dict[str, list]:
+    """Validate a decision-table request body.
+
+    The body must be ``{"domains": {field: [literal, ...], ...}}`` with a
+    non-empty object whose values are non-empty arrays of finite JSON
+    literals without structural duplicates (canonical-JSON identity, the same
+    used by counterfactual candidates).  Returns the normalized ``domains``
+    mapping; raises :class:`PolicyValidationError` with one error string per
+    detected problem.
+    """
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+
+    unknown_keys = set(payload) - {"domains"}
+    if unknown_keys:
+        raise PolicyValidationError(
+            [f"unknown keys {sorted(unknown_keys)}"]
+        )
+
+    errors: list[str] = []
+    domains = payload.get("domains")
+    if not isinstance(domains, dict) or not domains:
+        raise PolicyValidationError(
+            ["domains: must be a non-empty object with string keys"]
+        )
+    if not all(isinstance(key, str) for key in domains):
+        errors.append("domains: must be an object with string keys")
+
+    normalized: dict[str, list] = {}
+    for field_name in sorted(domains):
+        values = domains[field_name]
+        prefix = f"domains.{field_name}"
+        if not field_name:
+            errors.append(f"{prefix}: field name must be a non-empty string")
+        if not isinstance(values, list) or not values:
+            errors.append(f"{prefix}: must be a non-empty array")
+            continue
+
+        literals: list = []
+        seen: set[str] = set()
+        bad_literal = False
+        for index, value in enumerate(values):
+            if not _json_literal(value):
+                errors.append(
+                    f"{prefix}[{index}]: must be a JSON literal "
+                    "(null, bool, finite number, string, array or object "
+                    "of literals)"
+                )
+                bad_literal = True
+                continue
+            encoded = canonical_json(value)
+            if encoded in seen:
+                errors.append(
+                    f"{prefix}[{index}]: duplicate value {canonical_json(value)}"
+                )
+                bad_literal = True
+            seen.add(encoded)
+            literals.append(value)
+        if not bad_literal:
+            normalized[field_name] = literals
+
+    if errors:
+        raise PolicyValidationError(errors)
+    return normalized
 
 
 def validate_evaluate_sources_request(payload: Any) -> list[dict]:
